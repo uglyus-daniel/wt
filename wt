@@ -1,8 +1,13 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 PROGRAM="wt"
-SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+SCRIPT_DIR="${SCRIPT_SOURCE%/*}"
+if [ "$SCRIPT_DIR" = "$SCRIPT_SOURCE" ]; then
+  SCRIPT_DIR="."
+fi
+SELF_PATH="$(cd "$SCRIPT_DIR" 2>/dev/null && pwd -P)/${SCRIPT_SOURCE##*/}"
 
 RESET=""
 RED=""
@@ -455,17 +460,36 @@ cmd_new() {
 
 cmd_ls() {
   local interactive=0
-  local branch head dirty wt dirty_color
+  local path_only=0
+  local branch head dirty wt dirty_color selected selected_path
   setup_repo_context
 
-  if [ "${1:-}" = "--fzf" ] || [ "${1:-}" = "-f" ]; then
-    interactive=1
-  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fzf|-f) interactive=1 ;;
+      --path-only) path_only=1 ;;
+      *)
+        die "Usage: wt ls [--fzf|-f] [--path-only]"
+        ;;
+    esac
+    shift
+  done
 
   if [ "$interactive" -eq 1 ]; then
     has_cmd fzf || die "fzf is not installed."
-    render_worktree_rows | fzf --prompt="wt ls> " --height=50% --reverse
+    selected="$(render_worktree_rows | fzf --prompt="wt ls> " --height=50% --reverse || true)"
+    [ -n "$selected" ] || return 1
+    if [ "$path_only" -eq 1 ]; then
+      selected_path="${selected##*$'\t'}"
+      printf "%s\n" "$selected_path"
+    else
+      printf "%s\n" "$selected"
+    fi
     return 0
+  fi
+
+  if [ "$path_only" -eq 1 ]; then
+    die "--path-only is only available with --fzf"
   fi
 
   printf "%-30s %-10s %-8s %s\n" "BRANCH" "HEAD" "STATE" "PATH"
@@ -697,8 +721,11 @@ cmd_install() {
 # wt cd 지원을 위한 shell 함수
 wt() {
   if [ "$1" = "cd" ]; then
-    local path
-    path=$("$HOME/wt/wt" cd_path "${@:2}") && cd "$path"
+    local target_path
+    target_path=$("$HOME/wt/wt" cd_path "${@:2}") && cd "$target_path"
+  elif [ "$1" = "ls" ] && { [ "${2:-}" = "--fzf" ] || [ "${2:-}" = "-f" ]; }; then
+    local target_path
+    target_path=$("$HOME/wt/wt" ls "${@:2}" --path-only) && [ -n "$target_path" ] && cd "$target_path"
   else
     "$HOME/wt/wt" "$@"
   fi
@@ -718,7 +745,7 @@ usage() {
   cat <<'EOF'
 사용법:
   wt new <branch> [base-branch]   새 워크트리 생성 (브랜치 없으면 base 기준으로 생성)
-  wt ls [--fzf]                   워크트리 목록 출력 (fzf가 있으면 선택 모드 사용 가능)
+  wt ls [--fzf]                   워크트리 목록 출력 (쉘 함수 사용 시 fzf 선택 후 자동 cd)
   wt rm [-f|--force] <branch>     워크트리 제거 (브랜치/슬러그/디렉토리명 허용)
   wt cd <branch>                  해당 워크트리 경로 출력 (브랜치/슬러그/디렉토리명 허용)
   wt cd_path <branch>             해당 워크트리 절대 경로만 출력
