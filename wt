@@ -1,0 +1,786 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM="wt"
+SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+
+RESET=""
+RED=""
+GREEN=""
+YELLOW=""
+CYAN=""
+
+if [ -t 1 ]; then
+  RESET="\033[0m"
+  RED="\033[31m"
+  GREEN="\033[32m"
+  YELLOW="\033[33m"
+  CYAN="\033[36m"
+fi
+
+info() { printf "%b\n" "${CYAN}[info]${RESET} $*" >&2; }
+success() { printf "%b\n" "${GREEN}[ok]${RESET} $*" >&2; }
+warn() { printf "%b\n" "${YELLOW}[warn]${RESET} $*" >&2; }
+error() { printf "%b\n" "${RED}[error]${RESET} $*" >&2; }
+die() { error "$*"; exit 1; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+require_cmd() { has_cmd "$1" || die "Required command not found: $1"; }
+
+canonical_dir() {
+  (cd "$1" 2>/dev/null && pwd -P)
+}
+
+join_rel() {
+  local left="$1"
+  local right="$2"
+  if [ "$left" = "." ] || [ -z "$left" ]; then
+    printf "%s\n" "$right"
+  else
+    printf "%s/%s\n" "$left" "$right"
+  fi
+}
+
+path_from_root() {
+  local root="$1"
+  local rel="$2"
+  if [ "$rel" = "." ] || [ -z "$rel" ]; then
+    printf "%s\n" "$root"
+  else
+    printf "%s/%s\n" "$root" "$rel"
+  fi
+}
+
+slugify_branch() {
+  printf "%s\n" "$1" | tr '/' '-'
+}
+
+require_repo() {
+  require_cmd git
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Run this command inside a git repository."
+}
+
+primary_worktree_path() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *)
+        printf "%s\n" "${line#worktree }"
+        return 0
+        ;;
+    esac
+  done < <(git worktree list --porcelain)
+  return 1
+}
+
+emit_worktree_records() {
+  local line wt="" head="" branch_ref=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ]; then
+      if [ -n "$wt" ]; then
+        if [ -n "$branch_ref" ]; then
+          printf "%s\t%s\t%s\n" "$wt" "${branch_ref#refs/heads/}" "$head"
+        else
+          printf "%s\t%s\t%s\n" "$wt" "(detached)" "$head"
+        fi
+      fi
+      wt=""
+      head=""
+      branch_ref=""
+      continue
+    fi
+    case "$line" in
+      worktree\ *) wt="${line#worktree }" ;;
+      HEAD\ *) head="${line#HEAD }" ;;
+      branch\ *) branch_ref="${line#branch }" ;;
+    esac
+  done < <(git worktree list --porcelain)
+
+  if [ -n "$wt" ]; then
+    if [ -n "$branch_ref" ]; then
+      printf "%s\t%s\t%s\n" "$wt" "${branch_ref#refs/heads/}" "$head"
+    else
+      printf "%s\t%s\t%s\n" "$wt" "(detached)" "$head"
+    fi
+  fi
+}
+
+worktree_path_for_branch() {
+  local target="$1"
+  local wt branch head
+  while IFS=$'\t' read -r wt branch head; do
+    if [ "$branch" = "$target" ]; then
+      printf "%s\n" "$wt"
+      return 0
+    fi
+  done < <(emit_worktree_records)
+  return 1
+}
+
+worktree_records_for_query() {
+  local target="$1"
+  local wt branch head slug dir_name
+  while IFS=$'\t' read -r wt branch head; do
+    [ "$branch" = "(detached)" ] && continue
+    slug="$(slugify_branch "$branch")"
+    dir_name="$(basename "$wt")"
+    if [ "$branch" = "$target" ] || [ "$slug" = "$target" ] || [ "$dir_name" = "$target" ]; then
+      printf "%s\t%s\n" "$branch" "$wt"
+    fi
+  done < <(emit_worktree_records)
+}
+
+resolve_worktree_record() {
+  local target="$1"
+  local line branch wt
+  local count=0
+  local matched_branch=""
+  local matched_wt=""
+
+  while IFS=$'\t' read -r branch wt; do
+    count=$((count + 1))
+    matched_branch="$branch"
+    matched_wt="$wt"
+  done < <(worktree_records_for_query "$target")
+
+  if [ "$count" -eq 1 ]; then
+    printf "%s\t%s\n" "$matched_branch" "$matched_wt"
+    return 0
+  fi
+
+  if [ "$count" -gt 1 ]; then
+    error "Ambiguous branch/worktree selector: $target"
+    warn "Matched worktrees:"
+    worktree_records_for_query "$target" | while IFS=$'\t' read -r branch wt; do
+      printf "  - %s (%s)\n" "$branch" "$wt" >&2
+    done
+    return 2
+  fi
+
+  return 1
+}
+
+suggest_branches_for_query() {
+  local target="$1"
+  local prefix=""
+  local branch wt head slug
+
+  if [[ "$target" == */* ]]; then
+    prefix="${target%/*}/"
+  fi
+
+  while IFS=$'\t' read -r wt branch head; do
+    [ "$branch" = "(detached)" ] && continue
+    slug="$(slugify_branch "$branch")"
+    if [[ "$branch" == *"$target"* ]] || [[ "$slug" == *"$target"* ]]; then
+      printf "%s\n" "$branch"
+      continue
+    fi
+    if [ -n "$prefix" ] && [[ "$branch" == "$prefix"* ]]; then
+      printf "%s\n" "$branch"
+    fi
+  done < <(emit_worktree_records) | awk '!seen[$0]++'
+}
+
+print_no_worktree_match_error() {
+  local target="$1"
+  local suggestion
+
+  error "No worktree found for: $target"
+  suggestion="$(suggest_branches_for_query "$target" || true)"
+  if [ -n "$suggestion" ]; then
+    warn "Did you mean:"
+    while IFS= read -r line; do
+      printf "  - %s\n" "$line" >&2
+    done <<< "$suggestion"
+  else
+    warn "Available branches:"
+    list_worktree_branches | while IFS= read -r line; do
+      printf "  - %s\n" "$line" >&2
+    done
+  fi
+}
+
+current_worktree_branch() {
+  local cwd wt branch head wt_canon
+  cwd="$(pwd -P)"
+
+  while IFS=$'\t' read -r wt branch head; do
+    [ "$branch" = "(detached)" ] && continue
+    wt_canon="$(canonical_dir "$wt" || true)"
+    [ -n "$wt_canon" ] || continue
+    case "$cwd" in
+      "$wt_canon"|"$wt_canon"/*)
+        printf "%s\n" "$branch"
+        return 0
+        ;;
+    esac
+  done < <(emit_worktree_records)
+
+  return 1
+}
+
+list_worktree_branches() {
+  local wt branch head
+  while IFS=$'\t' read -r wt branch head; do
+    if [ "$branch" != "(detached)" ]; then
+      printf "%s\n" "$branch"
+    fi
+  done < <(emit_worktree_records)
+}
+
+choose_branch_interactive() {
+  local prompt="$1"
+  if ! has_cmd fzf; then
+    return 1
+  fi
+  list_worktree_branches | fzf --prompt="$prompt" --height=40% --reverse
+}
+
+REPO_ROOT=""
+PRIMARY_ROOT=""
+PRIMARY_ROOT_CANON=""
+REPO_NAME=""
+CONFIG_PATH=""
+PACKAGE_REL=""
+BASE_DIR=""
+ENV_REL=""
+ENV_SOURCE=""
+
+WT_WEB_DIR=""
+WT_BASE_DIR=""
+WT_ENV_FILE=""
+
+detect_package_rel() {
+  local root="$1"
+  local candidate="" d
+
+  if [ -n "${WT_WEB_DIR:-}" ]; then
+    candidate="${WT_WEB_DIR%/}"
+    if [[ "$candidate" = /* ]]; then
+      case "$candidate" in
+        "$root") candidate="." ;;
+        "$root"/*) candidate="${candidate#"$root"/}" ;;
+        *)
+          warn "WT_WEB_DIR must be relative to repo root: $WT_WEB_DIR"
+          candidate=""
+          ;;
+      esac
+    fi
+
+    if [ -n "$candidate" ]; then
+      if [ "$candidate" = "." ] && [ -f "$root/package.json" ]; then
+        printf ".\n"
+        return 0
+      fi
+      if [ "$candidate" != "." ] && [ -f "$root/$candidate/package.json" ]; then
+        printf "%s\n" "$candidate"
+        return 0
+      fi
+      warn "WT_WEB_DIR package.json not found at '$candidate'; fallback to auto-detect."
+    fi
+  fi
+
+  if [ -f "$root/package.json" ]; then
+    printf ".\n"
+    return 0
+  fi
+
+  shopt -s nullglob
+  for d in "$root"/*; do
+    if [ -d "$d" ] && [ -f "$d/package.json" ]; then
+      printf "%s\n" "${d#"$root"/}"
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+setup_repo_context() {
+  require_repo
+
+  REPO_ROOT="$(git rev-parse --show-toplevel)"
+  PRIMARY_ROOT="$(primary_worktree_path)"
+  PRIMARY_ROOT_CANON="$(canonical_dir "$PRIMARY_ROOT")"
+  REPO_NAME="$(basename "$PRIMARY_ROOT_CANON")"
+  CONFIG_PATH="$PRIMARY_ROOT_CANON/.wtconfig"
+
+  WT_WEB_DIR=""
+  WT_BASE_DIR=""
+  WT_ENV_FILE=""
+  if [ -f "$CONFIG_PATH" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_PATH"
+  fi
+
+  PACKAGE_REL="$(detect_package_rel "$PRIMARY_ROOT_CANON")" || die "Cannot find package.json in repo root or 1-depth subdirectories."
+  BASE_DIR="${WT_BASE_DIR:-$HOME/worktrees/$REPO_NAME}"
+
+  if [ -n "${WT_ENV_FILE:-}" ]; then
+    if [[ "$WT_ENV_FILE" = /* ]]; then
+      die "WT_ENV_FILE must be relative to the repo root."
+    fi
+    ENV_REL="$WT_ENV_FILE"
+  else
+    ENV_REL="$(join_rel "$PACKAGE_REL" ".env")"
+  fi
+
+  ENV_SOURCE="$(path_from_root "$PRIMARY_ROOT_CANON" "$ENV_REL")"
+}
+
+PM_NAME=""
+PM_INSTALL_CMD=()
+PM_DEV_CMD=()
+
+detect_package_manager() {
+  local package_dir="$1"
+  PM_NAME=""
+  PM_INSTALL_CMD=()
+  PM_DEV_CMD=()
+
+  if [ -f "$package_dir/bun.lockb" ]; then
+    PM_NAME="bun"
+    PM_INSTALL_CMD=(bun install)
+    PM_DEV_CMD=(bun run dev)
+  elif [ -f "$package_dir/pnpm-lock.yaml" ]; then
+    PM_NAME="pnpm"
+    PM_INSTALL_CMD=(pnpm install --frozen-lockfile)
+    PM_DEV_CMD=(pnpm dev)
+  elif [ -f "$package_dir/yarn.lock" ]; then
+    PM_NAME="yarn"
+    PM_INSTALL_CMD=(yarn install --frozen-lockfile)
+    PM_DEV_CMD=(yarn dev)
+  elif [ -f "$package_dir/package-lock.json" ]; then
+    PM_NAME="npm"
+    PM_INSTALL_CMD=(npm ci)
+    PM_DEV_CMD=(npm run dev)
+  else
+    PM_NAME="npm"
+    PM_INSTALL_CMD=(npm install)
+    PM_DEV_CMD=(npm run dev)
+    warn "No lockfile found in $package_dir. Falling back to npm install."
+  fi
+}
+
+copy_env_to_worktree() {
+  local wt_path="$1"
+  local env_target
+
+  if [ ! -f "$ENV_SOURCE" ]; then
+    warn "Source env file not found: $ENV_SOURCE"
+    return 0
+  fi
+
+  env_target="$(path_from_root "$wt_path" "$ENV_REL")"
+  mkdir -p "$(dirname "$env_target")"
+  cp "$ENV_SOURCE" "$env_target"
+  success ".env copied to $env_target"
+}
+
+install_dependencies_in_worktree() {
+  local wt_path="$1"
+  local package_dir
+  package_dir="$(path_from_root "$wt_path" "$PACKAGE_REL")"
+
+  if [ ! -f "$package_dir/package.json" ]; then
+    warn "package.json not found in worktree package dir: $package_dir"
+    return 0
+  fi
+
+  detect_package_manager "$package_dir"
+  require_cmd "$PM_NAME"
+  info "Installing dependencies with $PM_NAME in $package_dir"
+  (
+    cd "$package_dir"
+    "${PM_INSTALL_CMD[@]}"
+  )
+}
+
+render_worktree_rows() {
+  local wt branch head dirty head_short
+  while IFS=$'\t' read -r wt branch head; do
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+      dirty="dirty"
+    else
+      dirty="clean"
+    fi
+    head_short="${head:0:7}"
+    printf "%s\t%s\t%s\t%s\n" "$branch" "$head_short" "$dirty" "$wt"
+  done < <(emit_worktree_records)
+}
+
+cmd_new() {
+  local branch="${1:-}"
+  local base_branch="${2:-}"
+  local wt_path slug existing default_base
+
+  [ -n "$branch" ] || die "Usage: wt new <branch> [base-branch]"
+  setup_repo_context
+
+  slug="$(slugify_branch "$branch")"
+  wt_path="$BASE_DIR/$slug"
+  mkdir -p "$BASE_DIR"
+
+  existing="$(worktree_path_for_branch "$branch" || true)"
+  if [ -n "$existing" ]; then
+    warn "Branch '$branch' is already checked out in: $existing"
+    printf "%s\n" "$existing"
+    return 0
+  fi
+
+  if [ -e "$wt_path" ]; then
+    die "Target path already exists: $wt_path"
+  fi
+
+  if git show-ref --verify --quiet "refs/heads/$branch"; then
+    info "Adding existing branch '$branch' to worktree"
+    git -C "$PRIMARY_ROOT_CANON" worktree add "$wt_path" "$branch"
+  else
+    if [ -z "$base_branch" ]; then
+      default_base="$(git -C "$PRIMARY_ROOT_CANON" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+      base_branch="${default_base:-HEAD}"
+    fi
+    info "Creating branch '$branch' from '$base_branch'"
+    git -C "$PRIMARY_ROOT_CANON" worktree add -b "$branch" "$wt_path" "$base_branch"
+  fi
+
+  copy_env_to_worktree "$wt_path"
+  install_dependencies_in_worktree "$wt_path"
+
+  success "Worktree ready: $wt_path"
+  printf "%s\n" "$wt_path"
+}
+
+cmd_ls() {
+  local interactive=0
+  local branch head dirty wt dirty_color
+  setup_repo_context
+
+  if [ "${1:-}" = "--fzf" ] || [ "${1:-}" = "-f" ]; then
+    interactive=1
+  fi
+
+  if [ "$interactive" -eq 1 ]; then
+    has_cmd fzf || die "fzf is not installed."
+    render_worktree_rows | fzf --prompt="wt ls> " --height=50% --reverse
+    return 0
+  fi
+
+  printf "%-30s %-10s %-8s %s\n" "BRANCH" "HEAD" "STATE" "PATH"
+  printf "%-30s %-10s %-8s %s\n" "------" "----" "-----" "----"
+  while IFS=$'\t' read -r branch head dirty wt; do
+    if [ "$dirty" = "dirty" ]; then
+      dirty_color="${RED}${dirty}${RESET}"
+    else
+      dirty_color="${GREEN}${dirty}${RESET}"
+    fi
+    printf "%-30s %-10s %-8b %s\n" "$branch" "$head" "$dirty_color" "$wt"
+  done < <(render_worktree_rows)
+}
+
+resolve_branch_arg() {
+  local provided="${1:-}"
+  local prompt="$2"
+  local selected
+
+  if [ -n "$provided" ]; then
+    printf "%s\n" "$provided"
+    return 0
+  fi
+
+  selected="$(choose_branch_interactive "$prompt" || true)"
+  if [ -n "$selected" ]; then
+    printf "%s\n" "$selected"
+    return 0
+  fi
+
+  warn "Branch argument is required."
+  warn "Available branches:"
+  list_worktree_branches >&2
+  return 1
+}
+
+cmd_rm() {
+  local force=0
+  local branch=""
+  local wt_path resolved
+  local answer
+  local dirty=0
+
+  setup_repo_context
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force) force=1 ;;
+      *)
+        if [ -z "$branch" ]; then
+          branch="$1"
+        else
+          die "Usage: wt rm [-f|--force] <branch>"
+        fi
+        ;;
+    esac
+    shift
+  done
+
+  branch="$(resolve_branch_arg "$branch" "wt rm> ")"
+  resolved="$(resolve_worktree_record "$branch" || true)"
+  if [ -z "$resolved" ]; then
+    print_no_worktree_match_error "$branch"
+    return 1
+  fi
+  wt_path="${resolved#*$'\t'}"
+
+  if [ "$(canonical_dir "$wt_path")" = "$PRIMARY_ROOT_CANON" ]; then
+    die "Cannot remove the primary worktree: $wt_path"
+  fi
+
+  if [ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]; then
+    dirty=1
+  fi
+
+  if [ "$dirty" -eq 1 ] && [ "$force" -eq 0 ]; then
+    warn "Dirty working tree detected: $wt_path"
+    if [ -t 0 ]; then
+      printf "Remove anyway? [y/N]: " >&2
+      read -r answer
+      case "$answer" in
+        y|Y|yes|YES) force=1 ;;
+        *)
+          info "Cancelled."
+          return 1
+          ;;
+      esac
+    else
+      die "Use --force to remove a dirty worktree in non-interactive mode."
+    fi
+  fi
+
+  if [ "$force" -eq 1 ]; then
+    git -C "$PRIMARY_ROOT_CANON" worktree remove --force "$wt_path"
+  else
+    git -C "$PRIMARY_ROOT_CANON" worktree remove "$wt_path"
+  fi
+
+  if [ -n "$wt_path" ] && [ "$wt_path" != "/" ] && [ -d "$wt_path" ]; then
+    rm -rf "$wt_path"
+  fi
+
+  success "Removed worktree: $wt_path"
+}
+
+cmd_cd_path() {
+  local branch="${1:-}"
+  local wt_path resolved
+
+  setup_repo_context
+  branch="$(resolve_branch_arg "$branch" "wt cd> ")"
+  resolved="$(resolve_worktree_record "$branch" || true)"
+  if [ -z "$resolved" ]; then
+    print_no_worktree_match_error "$branch"
+    return 1
+  fi
+  wt_path="${resolved#*$'\t'}"
+  printf "%s\n" "$wt_path"
+}
+
+cmd_dev() {
+  local branch="${1:-}"
+  local wt_path package_dir fallback_rel resolved
+
+  setup_repo_context
+  if [ -z "$branch" ]; then
+    branch="$(current_worktree_branch || true)"
+  fi
+  if [ -z "$branch" ]; then
+    branch="$(resolve_branch_arg "" "wt dev> ")"
+  fi
+
+  resolved="$(resolve_worktree_record "$branch" || true)"
+  if [ -z "$resolved" ]; then
+    print_no_worktree_match_error "$branch"
+    return 1
+  fi
+  wt_path="${resolved#*$'\t'}"
+
+  package_dir="$(path_from_root "$wt_path" "$PACKAGE_REL")"
+  if [ ! -f "$package_dir/package.json" ]; then
+    fallback_rel="$(detect_package_rel "$wt_path" || true)"
+    [ -n "$fallback_rel" ] || die "Cannot find package.json under worktree: $wt_path"
+    package_dir="$(path_from_root "$wt_path" "$fallback_rel")"
+  fi
+
+  detect_package_manager "$package_dir"
+  require_cmd "$PM_NAME"
+  info "Running dev with $PM_NAME in $package_dir"
+  (
+    cd "$package_dir"
+    "${PM_DEV_CMD[@]}"
+  )
+}
+
+cmd_status() {
+  local wt branch head out
+
+  setup_repo_context
+
+  while IFS=$'\t' read -r wt branch head; do
+    printf "%b\n" "${CYAN}${branch}${RESET}  $wt"
+    out="$(git -C "$wt" status --short)"
+    if [ -z "$out" ]; then
+      printf "  %b\n" "${GREEN}clean${RESET}"
+    else
+      while IFS= read -r line; do
+        printf "  %s\n" "$line"
+      done <<< "$out"
+    fi
+  done < <(emit_worktree_records)
+}
+
+cmd_sync() {
+  local branch="${1:-}"
+  local wt_path resolved
+  local count=0
+  local wt br head
+
+  setup_repo_context
+
+  if [ ! -f "$ENV_SOURCE" ]; then
+    warn "Source env file not found: $ENV_SOURCE"
+    return 0
+  fi
+
+  if [ -n "$branch" ]; then
+    resolved="$(resolve_worktree_record "$branch" || true)"
+    if [ -z "$resolved" ]; then
+      print_no_worktree_match_error "$branch"
+      return 1
+    fi
+    wt_path="${resolved#*$'\t'}"
+    copy_env_to_worktree "$wt_path"
+    count=1
+  else
+    while IFS=$'\t' read -r wt br head; do
+      if [ "$(canonical_dir "$wt")" = "$PRIMARY_ROOT_CANON" ]; then
+        continue
+      fi
+      copy_env_to_worktree "$wt"
+      count=$((count + 1))
+    done < <(emit_worktree_records)
+  fi
+
+  success "Synced env file to $count worktree(s)."
+}
+
+cmd_install() {
+  local target_dir="$HOME/wt"
+  local target="$target_dir/wt"
+  local zshrc="$HOME/.zshrc"
+  local marker_start="# >>> wt setup >>>"
+  local marker_end="# <<< wt setup <<<"
+
+  mkdir -p "$target_dir"
+  if [ "$SELF_PATH" != "$target" ]; then
+    cp "$SELF_PATH" "$target"
+    success "Installed script to $target"
+  else
+    success "Script already at $target"
+  fi
+  chmod +x "$target"
+
+  if ! grep -Fq "$marker_start" "$zshrc" 2>/dev/null; then
+    {
+      printf "\n%s\n" "$marker_start"
+      cat <<'EOF'
+# wt cd 지원을 위한 shell 함수
+wt() {
+  if [ "$1" = "cd" ]; then
+    local path
+    path=$("$HOME/wt/wt" cd_path "${@:2}") && cd "$path"
+  else
+    "$HOME/wt/wt" "$@"
+  fi
+}
+EOF
+      printf "%s\n" "$marker_end"
+    } >> "$zshrc"
+    success "Added wt shell integration to $zshrc"
+  else
+    info "wt shell integration already exists in $zshrc"
+  fi
+
+  info "Run 'source ~/.zshrc' (or open a new shell) to apply changes."
+}
+
+usage() {
+  cat <<'EOF'
+사용법:
+  wt new <branch> [base-branch]   새 워크트리 생성 (브랜치 없으면 base 기준으로 생성)
+  wt ls [--fzf]                   워크트리 목록 출력 (fzf가 있으면 선택 모드 사용 가능)
+  wt rm [-f|--force] <branch>     워크트리 제거 (브랜치/슬러그/디렉토리명 허용)
+  wt cd <branch>                  해당 워크트리 경로 출력 (브랜치/슬러그/디렉토리명 허용)
+  wt cd_path <branch>             해당 워크트리 절대 경로만 출력
+  wt dev [branch]                 dev 서버 실행 (branch 생략 시 현재 워크트리 사용)
+  wt status                       모든 워크트리의 git 변경사항 요약 출력
+  wt sync [branch]                메인 레포 .env를 워크트리로 다시 복사 (branch 선택 가능)
+  wt install                      ~/wt/wt 설치 + ~/.zshrc 함수 자동 등록
+  wt help                         현재 도움말 출력
+
+.wtconfig (레포 루트, 선택사항):
+  WT_WEB_DIR="package.json이 있는 서브디렉토리"
+  WT_BASE_DIR="$HOME/worktrees/<repo-name>"
+  WT_ENV_FILE="레포 루트 기준 .env 상대경로"
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    new)
+      shift
+      cmd_new "$@"
+      ;;
+    ls)
+      shift
+      cmd_ls "$@"
+      ;;
+    rm)
+      shift
+      cmd_rm "$@"
+      ;;
+    cd)
+      shift
+      cmd_cd_path "$@"
+      ;;
+    cd_path)
+      shift
+      cmd_cd_path "$@"
+      ;;
+    dev)
+      shift
+      cmd_dev "$@"
+      ;;
+    status)
+      shift
+      cmd_status "$@"
+      ;;
+    sync)
+      shift
+      cmd_sync "$@"
+      ;;
+    install)
+      shift
+      cmd_install "$@"
+      ;;
+    help|-h|--help|"")
+      usage
+      ;;
+    *)
+      die "Unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
