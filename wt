@@ -422,6 +422,32 @@ render_worktree_rows() {
   done < <(emit_worktree_records)
 }
 
+render_removable_worktree_rows() {
+  local wt branch head dirty head_short wt_canon
+  while IFS=$'\t' read -r wt branch head; do
+    wt_canon="$(canonical_dir "$wt" || true)"
+    [ -n "$wt_canon" ] || continue
+    if [ "$wt_canon" = "$PRIMARY_ROOT_CANON" ]; then
+      continue
+    fi
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+      dirty="dirty"
+    else
+      dirty="clean"
+    fi
+    head_short="${head:0:7}"
+    printf "%s\t%s\t%s\t%s\n" "$branch" "$head_short" "$dirty" "$wt"
+  done < <(emit_worktree_records)
+}
+
+choose_worktree_row_interactive() {
+  local prompt="$1"
+  if ! has_cmd fzf; then
+    return 1
+  fi
+  render_removable_worktree_rows | fzf --prompt="$prompt" --height=50% --reverse
+}
+
 cmd_new() {
   local branch="${1:-}"
   local base_branch="${2:-}"
@@ -465,7 +491,7 @@ cmd_new() {
 }
 
 cmd_ls() {
-  local interactive=0
+  local interactive=1
   local path_only=0
   local branch head dirty wt dirty_color selected selected_path
   setup_repo_context
@@ -473,16 +499,24 @@ cmd_ls() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --fzf|-f) interactive=1 ;;
+      --plain|--no-fzf) interactive=0 ;;
       --path-only) path_only=1 ;;
       *)
-        die "Usage: wt ls [--fzf|-f] [--path-only]"
+        die "Usage: wt ls [--plain|--no-fzf|--fzf|-f] [--path-only]"
         ;;
     esac
     shift
   done
 
+  if [ "$interactive" -eq 1 ] && ! has_cmd fzf; then
+    if [ "$path_only" -eq 1 ]; then
+      die "fzf is not installed."
+    fi
+    warn "fzf is not installed. Falling back to plain list output."
+    interactive=0
+  fi
+
   if [ "$interactive" -eq 1 ]; then
-    has_cmd fzf || die "fzf is not installed."
     selected="$(render_worktree_rows | fzf --prompt="wt ls> " --height=50% --reverse || true)"
     [ -n "$selected" ] || return 1
     if [ "$path_only" -eq 1 ]; then
@@ -495,7 +529,7 @@ cmd_ls() {
   fi
 
   if [ "$path_only" -eq 1 ]; then
-    die "--path-only is only available with --fzf"
+    die "--path-only is only available in interactive mode."
   fi
 
   printf "%-30s %-10s %-8s %s\n" "BRANCH" "HEAD" "STATE" "PATH"
@@ -536,8 +570,10 @@ cmd_rm() {
   local force=0
   local branch=""
   local wt_path resolved
+  local selected_row=""
   local answer
   local dirty=0
+  local selected_mode=0
 
   setup_repo_context
 
@@ -548,20 +584,33 @@ cmd_rm() {
         if [ -z "$branch" ]; then
           branch="$1"
         else
-          die "Usage: wt rm [-f|--force] <branch>"
+          die "Usage: wt rm [-f|--force] [branch]"
         fi
         ;;
     esac
     shift
   done
 
-  branch="$(resolve_branch_arg "$branch" "wt rm> ")"
-  resolved="$(resolve_worktree_record "$branch" || true)"
-  if [ -z "$resolved" ]; then
-    print_no_worktree_match_error "$branch"
-    return 1
+  if [ -z "$branch" ]; then
+    if [ -t 0 ] && has_cmd fzf; then
+      selected_row="$(choose_worktree_row_interactive "wt rm> " || true)"
+      [ -n "$selected_row" ] || return 1
+      selected_mode=1
+      branch="${selected_row%%$'\t'*}"
+      wt_path="${selected_row##*$'\t'}"
+    else
+      branch="$(resolve_branch_arg "$branch" "wt rm> ")"
+    fi
   fi
-  wt_path="${resolved#*$'\t'}"
+
+  if [ -z "$wt_path" ]; then
+    resolved="$(resolve_worktree_record "$branch" || true)"
+    if [ -z "$resolved" ]; then
+      print_no_worktree_match_error "$branch"
+      return 1
+    fi
+    wt_path="${resolved#*$'\t'}"
+  fi
 
   if [ "$(canonical_dir "$wt_path")" = "$PRIMARY_ROOT_CANON" ]; then
     die "Cannot remove the primary worktree: $wt_path"
@@ -569,6 +618,25 @@ cmd_rm() {
 
   if [ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]; then
     dirty=1
+  fi
+
+  if [ "$selected_mode" -eq 1 ] && [ "$force" -eq 0 ]; then
+    if [ "$dirty" -eq 1 ]; then
+      warn "Dirty working tree detected: $wt_path"
+    fi
+    printf "Really remove '%s' (%s)? [y/N]: " "$branch" "$wt_path" >&2
+    read -r answer
+    case "$answer" in
+      y|Y|yes|YES)
+        if [ "$dirty" -eq 1 ]; then
+          force=1
+        fi
+        ;;
+      *)
+        info "Cancelled."
+        return 1
+        ;;
+    esac
   fi
 
   if [ "$dirty" -eq 1 ] && [ "$force" -eq 0 ]; then
@@ -710,6 +778,7 @@ cmd_install() {
   local zshrc="$HOME/.zshrc"
   local marker_start="# >>> wt setup >>>"
   local marker_end="# <<< wt setup <<<"
+  local tmp_zshrc=""
 
   mkdir -p "$target_dir"
   if [ "$SELF_PATH" != "$target" ]; then
@@ -720,16 +789,26 @@ cmd_install() {
   fi
   chmod +x "$target"
 
-  if ! grep -Fq "$marker_start" "$zshrc" 2>/dev/null; then
-    {
-      printf "\n%s\n" "$marker_start"
-      cat <<'EOF'
+  touch "$zshrc"
+  if grep -Fq "$marker_start" "$zshrc" 2>/dev/null; then
+    tmp_zshrc="$(mktemp)"
+    awk -v start="$marker_start" -v end="$marker_end" '
+      $0 == start { skip = 1; next }
+      $0 == end { skip = 0; next }
+      !skip { print }
+    ' "$zshrc" > "$tmp_zshrc"
+    mv "$tmp_zshrc" "$zshrc"
+  fi
+
+  {
+    printf "\n%s\n" "$marker_start"
+    cat <<'EOF'
 # wt cd 지원을 위한 shell 함수
 wt() {
   if [ "$1" = "cd" ]; then
     local target_path
     target_path=$("$HOME/wt/wt" cd_path "${@:2}") && cd "$target_path"
-  elif [ "$1" = "ls" ] && { [ "${2:-}" = "--fzf" ] || [ "${2:-}" = "-f" ]; }; then
+  elif [ "$1" = "ls" ] && { [ $# -eq 1 ] || [ "${2:-}" = "--fzf" ] || [ "${2:-}" = "-f" ]; }; then
     local target_path
     target_path=$("$HOME/wt/wt" ls "${@:2}" --path-only) && [ -n "$target_path" ] && cd "$target_path"
   else
@@ -737,12 +816,9 @@ wt() {
   fi
 }
 EOF
-      printf "%s\n" "$marker_end"
-    } >> "$zshrc"
-    success "Added wt shell integration to $zshrc"
-  else
-    info "wt shell integration already exists in $zshrc"
-  fi
+    printf "%s\n" "$marker_end"
+  } >> "$zshrc"
+  success "Updated wt shell integration in $zshrc"
 
   info "Run 'source ~/.zshrc' (or open a new shell) to apply changes."
 }
@@ -751,8 +827,8 @@ usage() {
   cat <<'EOF'
 사용법:
   wt new <branch> [base-branch]   새 워크트리 생성 (브랜치 없으면 base 기준으로 생성)
-  wt ls [--fzf]                   워크트리 목록 출력 (쉘 함수 사용 시 fzf 선택 후 자동 cd)
-  wt rm [-f|--force] <branch>     워크트리 제거 (브랜치/슬러그/디렉토리명 허용)
+  wt ls [--plain]                 워크트리 목록 출력 (기본 fzf, --plain으로 텍스트 목록)
+  wt rm [-f|--force] [branch]     워크트리 제거 (branch 생략 시 fzf 목록 선택 + 삭제 확인)
   wt cd <branch>                  해당 워크트리 경로 출력 (브랜치/슬러그/디렉토리명 허용)
   wt cd_path <branch>             해당 워크트리 절대 경로만 출력
   wt dev [branch]                 dev 서버 실행 (branch 생략 시 현재 워크트리 사용)
