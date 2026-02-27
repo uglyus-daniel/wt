@@ -245,6 +245,7 @@ choose_branch_interactive() {
 REPO_ROOT=""
 PRIMARY_ROOT=""
 PRIMARY_ROOT_CANON=""
+CONTEXT_ROOT=""
 REPO_NAME=""
 CONFIG_PATH=""
 PACKAGE_REL=""
@@ -310,7 +311,12 @@ setup_repo_context() {
   PRIMARY_ROOT="$(primary_worktree_path)"
   PRIMARY_ROOT_CANON="$(canonical_dir "$PRIMARY_ROOT")"
   REPO_NAME="$(basename "$PRIMARY_ROOT_CANON")"
-  CONFIG_PATH="$PRIMARY_ROOT_CANON/.wtconfig"
+
+  CONTEXT_ROOT="$REPO_ROOT"
+  if [ ! -f "$CONTEXT_ROOT/.wtconfig" ] && [ "$CONTEXT_ROOT" != "$PRIMARY_ROOT_CANON" ]; then
+    CONTEXT_ROOT="$PRIMARY_ROOT_CANON"
+  fi
+  CONFIG_PATH="$CONTEXT_ROOT/.wtconfig"
 
   WT_WEB_DIR=""
   WT_BASE_DIR=""
@@ -320,7 +326,7 @@ setup_repo_context() {
     . "$CONFIG_PATH"
   fi
 
-  PACKAGE_REL="$(detect_package_rel "$PRIMARY_ROOT_CANON")" || die "Cannot find package.json in repo root or 1-depth subdirectories."
+  PACKAGE_REL="$(detect_package_rel "$CONTEXT_ROOT")" || die "Cannot find package.json in repo root or 1-depth subdirectories."
   BASE_DIR="${WT_BASE_DIR:-$HOME/worktrees/$REPO_NAME}"
 
   if [ -n "${WT_ENV_FILE:-}" ]; then
@@ -332,7 +338,7 @@ setup_repo_context() {
     ENV_REL="$(join_rel "$PACKAGE_REL" ".env")"
   fi
 
-  ENV_SOURCE="$(path_from_root "$PRIMARY_ROOT_CANON" "$ENV_REL")"
+  ENV_SOURCE="$(path_from_root "$CONTEXT_ROOT" "$ENV_REL")"
 }
 
 PM_NAME=""
