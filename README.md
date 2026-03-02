@@ -7,6 +7,20 @@
 - `.env` 자동 복사/동기화
 - 패키지 매니저 자동 감지 (`bun` / `pnpm` / `yarn` / `npm`)
 
+## 의존성
+
+| 도구 | 필수 여부 | 용도 |
+|------|-----------|------|
+| `git` | 필수 | 워크트리 관리 |
+| `fzf` | 권장 | `wt ls` / `wt rm` / `wt cd` 인터랙티브 선택 |
+
+`fzf`가 없으면 `wt install` 실행 시 자동으로 설치를 시도합니다.
+- macOS: `brew install fzf`
+- Ubuntu/Debian: `apt-get install fzf`
+- 기타: `~/.fzf` 에 GitHub에서 직접 설치
+
+`fzf` 없이도 `wt ls --plain`으로 텍스트 목록을 볼 수 있습니다.
+
 ## 설치 (git clone 기준)
 
 ```bash
@@ -17,6 +31,8 @@ chmod +x wt
 ./wt install
 source ~/.zshrc
 ```
+
+`wt install`은 스크립트 설치 + `~/.zshrc` 함수 등록 + fzf 자동 설치를 한 번에 처리합니다.
 
 설치 후에는 어디서든 `wt` 명령을 사용할 수 있습니다.
 
@@ -58,6 +74,7 @@ wt dev
 ## 참고
 
 - `wt cd`는 쉘 함수가 필요해서 `./wt install`이 선행되어야 합니다.
-- `wt ls`는 기본적으로 `fzf` 선택을 사용하며, 텍스트 목록은 `wt ls --plain`으로 볼 수 있습니다.
+- `wt ls`는 기본적으로 `fzf` 인터랙티브 선택을 사용하며, 텍스트 목록은 `wt ls --plain`으로 볼 수 있습니다.
 - `wt rm`은 브랜치를 생략하면 목록에서 고른 뒤 삭제 확인을 한 번 더 묻습니다.
 - `wt rm`, `wt cd`는 브랜치를 생략하면 `fzf` 인터랙티브 선택을 사용합니다.
+- `fzf`가 없으면 `wt install`이 자동 설치를 시도합니다. 수동 설치는 [junegunn/fzf](https://github.com/junegunn/fzf#installation)를 참고하세요.

@@ -772,6 +772,42 @@ cmd_sync() {
   success "Synced env file to $count worktree(s)."
 }
 
+install_fzf() {
+  if has_cmd fzf; then
+    success "fzf is already installed."
+    return 0
+  fi
+
+  info "fzf not found. Attempting to install..."
+
+  if has_cmd brew; then
+    info "Installing fzf via Homebrew..."
+    brew install fzf
+    success "fzf installed via Homebrew."
+    return 0
+  fi
+
+  if has_cmd apt-get; then
+    info "Installing fzf via apt-get..."
+    sudo apt-get install -y fzf
+    success "fzf installed via apt-get."
+    return 0
+  fi
+
+  if has_cmd git; then
+    info "Installing fzf from GitHub (~/.fzf)..."
+    git clone --depth 1 https://github.com/junegunn/fzf.git "$HOME/.fzf"
+    "$HOME/.fzf/install" --all --no-update-rc
+    export PATH="$HOME/.fzf/bin:$PATH"
+    success "fzf installed to ~/.fzf."
+    return 0
+  fi
+
+  warn "Could not install fzf automatically."
+  warn "Please install fzf manually: https://github.com/junegunn/fzf#installation"
+  return 1
+}
+
 cmd_install() {
   local target_dir="$HOME/wt"
   local target="$target_dir/wt"
@@ -788,6 +824,8 @@ cmd_install() {
     success "Script already at $target"
   fi
   chmod +x "$target"
+
+  install_fzf || true
 
   touch "$zshrc"
   if grep -Fq "$marker_start" "$zshrc" 2>/dev/null; then
