@@ -448,10 +448,31 @@ choose_worktree_row_interactive() {
   render_removable_worktree_rows | fzf --prompt="$prompt" --height=50% --reverse
 }
 
+warn_if_branch_behind_remote() {
+  local branch="$1"
+  local base_branch="$2"
+  local remote_ref="origin/$base_branch"
+
+  git fetch origin "$base_branch" --quiet 2>/dev/null || true
+
+  if ! git show-ref --quiet "refs/remotes/$remote_ref" 2>/dev/null; then
+    return 0
+  fi
+
+  local behind_count
+  behind_count="$(git rev-list --count "$branch".."$remote_ref" 2>/dev/null || echo 0)"
+
+  if [ "$behind_count" -gt 0 ]; then
+    warn "Branch '$branch' is ${behind_count} commit(s) behind ${remote_ref}."
+    warn "최신 상태로 맞추려면: git -C <worktree경로> rebase ${remote_ref}"
+  fi
+}
+
 cmd_new() {
   local branch="${1:-}"
   local base_branch="${2:-}"
   local wt_path slug existing default_base
+  local branch_existed=0
 
   [ -n "$branch" ] || die "Usage: wt new <branch> [base-branch]"
   setup_repo_context
@@ -463,6 +484,9 @@ cmd_new() {
   existing="$(worktree_path_for_branch "$branch" || true)"
   if [ -n "$existing" ]; then
     warn "Branch '$branch' is already checked out in: $existing"
+    if [ -n "$base_branch" ]; then
+      warn_if_branch_behind_remote "$branch" "$base_branch"
+    fi
     printf "%s\n" "$existing"
     return 0
   fi
@@ -474,6 +498,7 @@ cmd_new() {
   if git show-ref --verify --quiet "refs/heads/$branch"; then
     info "Adding existing branch '$branch' to worktree"
     git -C "$PRIMARY_ROOT_CANON" worktree add "$wt_path" "$branch"
+    branch_existed=1
   else
     if [ -z "$base_branch" ]; then
       default_base="$(git -C "$PRIMARY_ROOT_CANON" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
@@ -485,6 +510,10 @@ cmd_new() {
 
   copy_env_to_worktree "$wt_path"
   install_dependencies_in_worktree "$wt_path"
+
+  if [ "$branch_existed" -eq 1 ] && [ -n "$base_branch" ]; then
+    warn_if_branch_behind_remote "$branch" "$base_branch"
+  fi
 
   success "Worktree ready: $wt_path"
   printf "%s\n" "$wt_path"
@@ -841,11 +870,14 @@ cmd_install() {
   {
     printf "\n%s\n" "$marker_start"
     cat <<'EOF'
-# wt cd 지원을 위한 shell 함수
+# wt cd / wt new / wt ls 지원을 위한 shell 함수
 wt() {
   if [ "$1" = "cd" ]; then
     local target_path
     target_path=$("$HOME/wt/wt" cd_path "${@:2}") && cd "$target_path"
+  elif [ "$1" = "new" ]; then
+    local target_path
+    target_path=$("$HOME/wt/wt" new "${@:2}") && [ -n "$target_path" ] && cd "$target_path"
   elif [ "$1" = "ls" ] && { [ $# -eq 1 ] || [ "${2:-}" = "--fzf" ] || [ "${2:-}" = "-f" ]; }; then
     local target_path
     target_path=$("$HOME/wt/wt" ls "${@:2}" --path-only) && [ -n "$target_path" ] && cd "$target_path"
