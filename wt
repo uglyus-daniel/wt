@@ -468,6 +468,95 @@ warn_if_branch_behind_remote() {
   fi
 }
 
+# ── VSCode titlebar color ─────────────────────────────────────────────────────
+
+apply_vscode_titlebar_color() {
+  local wt_path="$1"
+  local settings_dir="$wt_path/.vscode"
+  local settings_file="$settings_dir/settings.json"
+
+  if ! has_cmd python3; then
+    warn "python3 not found. Skipping VSCode titlebar color."
+    return 0
+  fi
+
+  local palette=(
+    "#3b82f6" "#10b981" "#f59e0b" "#ef4444"
+    "#8b5cf6" "#ec4899" "#06b6d4" "#84cc16"
+    "#f97316" "#14b8a6" "#6366f1" "#a855f7"
+    "#22c55e" "#eab308" "#0ea5e9" "#f43f5e"
+  )
+  local count="${#palette[@]}"
+  local idx=$(( RANDOM % count ))
+  local active_bg="${palette[$idx]}"
+
+  local result
+  result="$(python3 - "$settings_file" "$active_bg" <<'PYEOF'
+import json, sys, os
+
+settings_path = sys.argv[1]
+active_bg     = sys.argv[2]
+
+# ── Hex helpers ──────────────────────────────────────────────────────────────
+def hex_to_rgb(h):
+    h = h.lstrip("#")
+    return int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+
+def darken(r, g, b, factor=0.9):
+    return "#{:02x}{:02x}{:02x}".format(
+        int(r*factor), int(g*factor), int(b*factor))
+
+def luminance(r, g, b):
+    def lin(c):
+        c /= 255.0
+        return c/12.92 if c <= 0.04045 else ((c+0.055)/1.055)**2.4
+    return 0.2126*lin(r) + 0.7152*lin(g) + 0.0722*lin(b)
+
+# ── Compute colors ────────────────────────────────────────────────────────────
+r, g, b = hex_to_rgb(active_bg)
+inactive_bg  = darken(r, g, b)
+fg           = "#000000" if luminance(r,g,b) > 0.179 else "#ffffff"
+active_fg    = fg
+inactive_fg  = fg + "aa"
+
+# ── Load or create settings ───────────────────────────────────────────────────
+if os.path.exists(settings_path):
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        print("JSONC_OR_INVALID", end="")
+        sys.exit(0)
+else:
+    settings = {}
+
+# ── Merge titlebar keys ───────────────────────────────────────────────────────
+if "workbench.colorCustomizations" not in settings:
+    settings["workbench.colorCustomizations"] = {}
+
+settings["workbench.colorCustomizations"].update({
+    "titleBar.activeBackground":   active_bg,
+    "titleBar.activeForeground":   active_fg,
+    "titleBar.inactiveBackground": inactive_bg,
+    "titleBar.inactiveForeground": inactive_fg,
+})
+
+# ── Write ─────────────────────────────────────────────────────────────────────
+os.makedirs(os.path.dirname(os.path.abspath(settings_path)), exist_ok=True)
+with open(settings_path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+)"
+
+  if [ "$result" = "JSONC_OR_INVALID" ]; then
+    warn "Could not parse .vscode/settings.json (may contain comments or be malformed). Skipping titlebar color."
+    return 0
+  fi
+
+  info "VSCode titlebar color set: $active_bg"
+}
+
 cmd_new() {
   local branch="${1:-}"
   local base_branch="${2:-}"
@@ -510,6 +599,7 @@ cmd_new() {
 
   copy_env_to_worktree "$wt_path"
   install_dependencies_in_worktree "$wt_path"
+  apply_vscode_titlebar_color "$wt_path"
 
   if [ "$branch_existed" -eq 1 ] && [ -n "$base_branch" ]; then
     warn_if_branch_behind_remote "$branch" "$base_branch"
