@@ -472,8 +472,7 @@ warn_if_branch_behind_remote() {
 
 apply_vscode_titlebar_color() {
   local wt_path="$1"
-  local settings_dir="$wt_path/.vscode"
-  local settings_file="$settings_dir/settings.json"
+  local settings_file="$wt_path/.vscode/settings.json"
 
   if ! has_cmd python3; then
     warn "python3 not found. Skipping VSCode titlebar color."
@@ -512,45 +511,54 @@ def luminance(r, g, b):
         return c/12.92 if c <= 0.04045 else ((c+0.055)/1.055)**2.4
     return 0.2126*lin(r) + 0.7152*lin(g) + 0.0722*lin(b)
 
-# ── Compute colors ────────────────────────────────────────────────────────────
-r, g, b = hex_to_rgb(active_bg)
-inactive_bg  = darken(r, g, b)
-fg           = "#000000" if luminance(r,g,b) > 0.179 else "#ffffff"
-active_fg    = fg
-inactive_fg  = fg + "aa"
+try:
+    # ── Compute colors ────────────────────────────────────────────────────────
+    r, g, b = hex_to_rgb(active_bg)
+    inactive_bg  = darken(r, g, b)
+    fg           = "#000000" if luminance(r,g,b) > 0.179 else "#ffffff"
+    active_fg    = fg
+    inactive_fg  = fg
 
-# ── Load or create settings ───────────────────────────────────────────────────
-if os.path.exists(settings_path):
-    try:
-        with open(settings_path) as f:
-            settings = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        print("JSONC_OR_INVALID", end="")
-        sys.exit(0)
-else:
-    settings = {}
+    # ── Load or create settings ───────────────────────────────────────────────
+    if os.path.exists(settings_path):
+        try:
+            with open(settings_path) as f:
+                settings = json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            print("JSONC_OR_INVALID", end="")
+            sys.exit(0)
+    else:
+        settings = {}
 
-# ── Merge titlebar keys ───────────────────────────────────────────────────────
-if "workbench.colorCustomizations" not in settings:
-    settings["workbench.colorCustomizations"] = {}
+    # ── Merge titlebar keys ───────────────────────────────────────────────────
+    if "workbench.colorCustomizations" not in settings:
+        settings["workbench.colorCustomizations"] = {}
 
-settings["workbench.colorCustomizations"].update({
-    "titleBar.activeBackground":   active_bg,
-    "titleBar.activeForeground":   active_fg,
-    "titleBar.inactiveBackground": inactive_bg,
-    "titleBar.inactiveForeground": inactive_fg,
-})
+    settings["workbench.colorCustomizations"].update({
+        "titleBar.activeBackground":   active_bg,
+        "titleBar.activeForeground":   active_fg,
+        "titleBar.inactiveBackground": inactive_bg,
+        "titleBar.inactiveForeground": inactive_fg,
+    })
 
-# ── Write ─────────────────────────────────────────────────────────────────────
-os.makedirs(os.path.dirname(os.path.abspath(settings_path)), exist_ok=True)
-with open(settings_path, "w") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
+    # ── Write ─────────────────────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(os.path.abspath(settings_path)), exist_ok=True)
+    with open(settings_path, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+except Exception as e:
+    print("ERROR", end="")
+    sys.exit(0)
 PYEOF
 )"
 
   if [ "$result" = "JSONC_OR_INVALID" ]; then
-    warn "Could not parse .vscode/settings.json (may contain comments or be malformed). Skipping titlebar color."
+    warn ".vscode/settings.json contains comments or is malformed (Python's json module does not support JSONC). Skipping titlebar color."
+    return 0
+  fi
+
+  if [ "$result" = "ERROR" ]; then
+    warn "Failed to write VSCode titlebar color. Skipping."
     return 0
   fi
 
