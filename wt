@@ -542,7 +542,8 @@ try:
     })
 
     # ── Write ─────────────────────────────────────────────────────────────────
-    os.makedirs(os.path.dirname(os.path.abspath(settings_path)), exist_ok=True)
+    settings_dir = os.path.dirname(os.path.abspath(settings_path))
+    os.makedirs(settings_dir, exist_ok=True)
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
@@ -560,6 +561,12 @@ PYEOF
   if [ "$result" = "ERROR" ]; then
     warn "Failed to write VSCode titlebar color. Skipping."
     return 0
+  fi
+
+  # Keep .vscode/ out of git status without touching .gitignore
+  local exclude_file="$wt_path/.git/info/exclude"
+  if [ -f "$exclude_file" ] && ! grep -qxF ".vscode/" "$exclude_file"; then
+    echo ".vscode/" >> "$exclude_file"
   fi
 
   info "VSCode titlebar color set: $active_bg"
