@@ -208,6 +208,7 @@ print_no_worktree_match_error() {
 
 current_worktree_branch() {
   local cwd wt branch head wt_canon
+  local best_len=0 best_branch=""
   cwd="$(pwd -P)"
 
   while IFS=$'\t' read -r wt branch head; do
@@ -216,12 +217,18 @@ current_worktree_branch() {
     [ -n "$wt_canon" ] || continue
     case "$cwd" in
       "$wt_canon"|"$wt_canon"/*)
-        printf "%s\n" "$branch"
-        return 0
+        if [ "${#wt_canon}" -gt "$best_len" ]; then
+          best_len=${#wt_canon}
+          best_branch="$branch"
+        fi
         ;;
     esac
   done < <(emit_worktree_records)
 
+  if [ -n "$best_branch" ]; then
+    printf "%s\n" "$best_branch"
+    return 0
+  fi
   return 1
 }
 
