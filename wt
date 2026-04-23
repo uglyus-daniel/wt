@@ -263,6 +263,7 @@ ENV_SOURCE=""
 WT_WEB_DIR=""
 WT_BASE_DIR=""
 WT_ENV_FILE=""
+WT_DEV_PORT=""
 
 detect_package_rel() {
   local root="$1"
@@ -328,6 +329,7 @@ setup_repo_context() {
   WT_WEB_DIR=""
   WT_BASE_DIR=""
   WT_ENV_FILE=""
+  WT_DEV_PORT=""
   if [ -f "$CONFIG_PATH" ]; then
     # shellcheck disable=SC1090
     . "$CONFIG_PATH"
@@ -825,9 +827,39 @@ cmd_cd_path() {
   printf "%s\n" "$wt_path"
 }
 
+kill_port_listeners() {
+  local port="$1"
+  local pids pid
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  has_cmd lsof || { warn "lsof not found; skip killing port $port listeners."; return 0; }
+
+  pids="$(lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  [ -n "$pids" ] || return 0
+
+  info "Killing existing listener(s) on port $port: $(printf '%s' "$pids" | tr '\n' ' ')"
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || true
+  done <<< "$pids"
+
+  local waited=0
+  while [ "$waited" -lt 15 ]; do
+    pids="$(lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    [ -z "$pids" ] && return 0
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+
+  warn "Port $port still occupied; sending SIGKILL."
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    kill -9 "$pid" 2>/dev/null || true
+  done <<< "$pids"
+}
+
 cmd_dev() {
   local branch="${1:-}"
-  local wt_path package_dir fallback_rel resolved
+  local wt_path package_dir fallback_rel resolved dev_port
 
   setup_repo_context
   if [ -z "$branch" ]; then
@@ -853,6 +885,10 @@ cmd_dev() {
 
   detect_package_manager "$package_dir"
   require_cmd "$PM_NAME"
+
+  dev_port="${WT_DEV_PORT:-3000}"
+  kill_port_listeners "$dev_port"
+
   info "Running dev with $PM_NAME in $package_dir"
   (
     cd "$package_dir"
@@ -1023,6 +1059,7 @@ usage() {
   WT_WEB_DIR="package.json이 있는 서브디렉토리"
   WT_BASE_DIR="$HOME/worktrees/<repo-name>"
   WT_ENV_FILE="레포 루트 기준 .env 상대경로"
+  WT_DEV_PORT="wt dev 실행 전 kill할 포트 (기본 3000)"
 EOF
 }
 
