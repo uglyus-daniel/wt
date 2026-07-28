@@ -125,14 +125,20 @@ worktree_path_for_branch() {
 worktree_records_for_query() {
   local target="$1"
   local wt branch head slug dir_name
+  local exact="" loose=""
   while IFS=$'\t' read -r wt branch head; do
     [ "$branch" = "(detached)" ] && continue
     slug="$(slugify_branch "$branch")"
     dir_name="$(basename "$wt")"
-    if [ "$branch" = "$target" ] || [ "$slug" = "$target" ] || [ "$dir_name" = "$target" ]; then
-      printf "%s\t%s\n" "$branch" "$wt"
+    if [ "$branch" = "$target" ]; then
+      exact+="$branch"$'\t'"$wt"$'\n'
+    elif [ "$slug" = "$target" ] || [ "$dir_name" = "$target" ]; then
+      loose+="$branch"$'\t'"$wt"$'\n'
     fi
   done < <(emit_worktree_records)
+  # ponytail: exact branch name wins; slug/dir-name are only a fallback, so a
+  # branch named X isn't ambiguous with another worktree living in a dir named X
+  printf "%s" "${exact:-$loose}"
 }
 
 resolve_worktree_record() {
