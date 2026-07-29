@@ -358,36 +358,60 @@ setup_repo_context() {
 
 PM_NAME=""
 PM_INSTALL_CMD=()
-PM_DEV_CMD=()
+PM_RUN_CMD=()
 
 detect_package_manager() {
   local package_dir="$1"
   PM_NAME=""
   PM_INSTALL_CMD=()
-  PM_DEV_CMD=()
+  PM_RUN_CMD=()
 
   if [ -f "$package_dir/bun.lockb" ]; then
     PM_NAME="bun"
     PM_INSTALL_CMD=(bun install)
-    PM_DEV_CMD=(bun run dev)
+    PM_RUN_CMD=(bun run)
   elif [ -f "$package_dir/pnpm-lock.yaml" ]; then
     PM_NAME="pnpm"
     PM_INSTALL_CMD=(pnpm install --frozen-lockfile)
-    PM_DEV_CMD=(pnpm dev)
+    PM_RUN_CMD=(pnpm run)
   elif [ -f "$package_dir/yarn.lock" ]; then
     PM_NAME="yarn"
     PM_INSTALL_CMD=(yarn install --frozen-lockfile)
-    PM_DEV_CMD=(yarn dev)
+    PM_RUN_CMD=(yarn run)
   elif [ -f "$package_dir/package-lock.json" ]; then
     PM_NAME="npm"
     PM_INSTALL_CMD=(npm ci)
-    PM_DEV_CMD=(npm run dev)
+    PM_RUN_CMD=(npm run)
   else
     PM_NAME="npm"
     PM_INSTALL_CMD=(npm install)
-    PM_DEV_CMD=(npm run dev)
+    PM_RUN_CMD=(npm run)
     warn "No lockfile found in $package_dir. Falling back to npm install."
   fi
+}
+
+# package.json에 실제로 존재하는 dev 스크립트를 찾는다 (dev 우선, 없으면 start).
+# "<script-name><TAB><script-command>" 형식으로 출력.
+detect_dev_script() {
+  local package_dir="$1"
+
+  # python3이 없으면 기존 동작(dev)으로 폴백
+  has_cmd python3 || { printf 'dev\t\n'; return 0; }
+
+  python3 - "$package_dir/package.json" <<'PY'
+import json, sys
+
+try:
+    scripts = json.load(open(sys.argv[1])).get("scripts") or {}
+except Exception:
+    scripts = {}
+
+for name in ("dev", "start"):
+    cmd = scripts.get(name)
+    if cmd:
+        print(name + "\t" + cmd)
+        break
+PY
 }
 
 copy_env_to_worktree() {
@@ -866,6 +890,8 @@ kill_port_listeners() {
 cmd_dev() {
   local branch="${1:-}"
   local wt_path package_dir fallback_rel resolved dev_port
+  local script_record dev_script dev_script_cmd
+  local dev_cmd=()
 
   setup_repo_context
   if [ -z "$branch" ]; then
@@ -892,13 +918,27 @@ cmd_dev() {
   detect_package_manager "$package_dir"
   require_cmd "$PM_NAME"
 
+  script_record="$(detect_dev_script "$package_dir")"
+  dev_script="${script_record%%$'\t'*}"
+  dev_script_cmd="${script_record#*$'\t'}"
+  [ -n "$dev_script" ] || die "No 'dev' or 'start' script in $package_dir/package.json"
+
   dev_port="${WT_DEV_PORT:-3000}"
   kill_port_listeners "$dev_port"
 
-  info "Running dev with $PM_NAME in $package_dir"
+  dev_cmd=("${PM_RUN_CMD[@]}" "$dev_script")
+  if [ -n "${WT_DEV_PORT:-}" ]; then
+    export PORT="$WT_DEV_PORT"
+    # ponytail: vite는 PORT env를 안 읽어서 플래그로 넘긴다. 다른 러너가 필요해지면 그때 분기 추가.
+    case "$dev_script_cmd" in
+      vite|"vite "*) dev_cmd+=(-- --port "$WT_DEV_PORT") ;;
+    esac
+  fi
+
+  info "Running '$dev_script' with $PM_NAME in $package_dir${WT_DEV_PORT:+ (port $WT_DEV_PORT)}"
   (
     cd "$package_dir"
-    "${PM_DEV_CMD[@]}"
+    "${dev_cmd[@]}"
   )
 }
 
@@ -1065,7 +1105,7 @@ usage() {
   WT_WEB_DIR="package.json이 있는 서브디렉토리"
   WT_BASE_DIR="$HOME/worktrees/<repo-name>"
   WT_ENV_FILE="레포 루트 기준 .env 상대경로"
-  WT_DEV_PORT="wt dev 실행 전 kill할 포트 (기본 3000)"
+  WT_DEV_PORT="dev 포트 (설정하면 해당 포트로 강제 실행, 실행 전 기존 리스너 kill / 미설정 시 3000만 kill)"
 EOF
 }
 
